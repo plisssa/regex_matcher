@@ -1,0 +1,20 @@
+elizavetapuzyreva@MacBook-Pro-3 regex_project  % DATA="./example/data"
+REF="./example/regex_matcher"
+
+echo "== C++ regex_matcher =="
+/usr/bin/time -p ./regex_matcher_fixed "$DATA/re" "$DATA/text" out_cpp
+
+echo "== Python re.findall reference =="
+/usr/bin/time -p python3 "$REF" "$DATA/re" "$DATA/text" out_py
+
+echo "== Compare outputs =="
+diff -q out_cpp out_py
+== C++ regex_matcher ==
+real 3,12
+user 31,70
+sys 0,14
+== Python re.findall reference ==
+real 52,16
+user 51,38
+sys 0,65
+== Compare outputs ==
