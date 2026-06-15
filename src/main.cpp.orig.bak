@@ -1,0 +1,498 @@
+#include <algorithm>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+using namespace std;
+
+static unordered_map<string, int> cmap;
+static int nextId = 1;
+
+static int getId(const string& cp)
+{
+    auto it = cmap.find(cp);
+    if (it != cmap.end()) {
+        return it->second;
+    }
+    int id = nextId++;
+    cmap[cp] = id;
+    return id;
+}
+
+static bool nextCp(const string& s, size_t& i, string& cp)
+{
+    if (i >= s.size()) {
+        return false;
+    }
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = 1;
+    if ((c & 0x80u) == 0u) {
+        len = 1;
+    } else if ((c & 0xe0u) == 0xc0u) {
+        len = 2;
+    } else if ((c & 0xf0u) == 0xe0u) {
+        len = 3;
+    } else if ((c & 0xf8u) == 0xf0u) {
+        len = 4;
+    }
+    if (i + len > s.size()) {
+        len = 1;
+    }
+    cp = s.substr(i, len);
+    i += len;
+    return true;
+}
+
+static vector<int> transformText(const string& in)
+{
+    vector<int> result;
+    size_t i = 0;
+    string cp;
+    while (nextCp(in, i, cp)) {
+        result.push_back(getId(cp));
+    }
+    return result;
+}
+
+enum StateType {
+    ST_CHAR,
+    ST_SPLIT,
+    ST_JMP,
+    ST_MATCH
+};
+
+struct State {
+    int type;
+    int ch;
+    int out1;
+    int out2;
+};
+
+struct PatchRef {
+    int state;
+    int slot;
+};
+
+struct Frag {
+    int start;
+    vector<PatchRef> out;
+};
+
+struct Engine {
+    vector<State> states;
+    vector<string> tokens;
+    int tokenPos = 0;
+    int startState = -1;
+    int matchState = -1;
+    bool bad = false;
+    mutable vector<int> seen;
+    mutable int seenTag = 1;
+    bool nullable = false;
+    unordered_set<int> firstChars;
+
+    int addState(int type, int ch = 0, int out1 = -1, int out2 = -1)
+    {
+        states.push_back({ type, ch, out1, out2 });
+        return static_cast<int>(states.size()) - 1;
+    }
+
+    static vector<PatchRef> onePatch(int state, int slot)
+    {
+        return vector<PatchRef> { { state, slot } };
+    }
+
+    void patch(const vector<PatchRef>& refs, int target)
+    {
+        for (const PatchRef& ref : refs) {
+            if (ref.slot == 1) {
+                states[ref.state].out1 = target;
+            } else {
+                states[ref.state].out2 = target;
+            }
+        }
+    }
+
+    static vector<PatchRef> appendPatch(vector<PatchRef> left, const vector<PatchRef>& right)
+    {
+        left.insert(left.end(), right.begin(), right.end());
+        return left;
+    }
+
+    Frag literal(int ch)
+    {
+        int state = addState(ST_CHAR, ch);
+        return { state, onePatch(state, 1) };
+    }
+
+    Frag epsilon()
+    {
+        int state = addState(ST_JMP);
+        return { state, onePatch(state, 1) };
+    }
+
+    Frag concatenate(Frag left, Frag right)
+    {
+        patch(left.out, right.start);
+        return { left.start, right.out };
+    }
+
+    Frag alternate(Frag left, Frag right)
+    {
+        int state = addState(ST_SPLIT, 0, left.start, right.start);
+        return { state, appendPatch(left.out, right.out) };
+    }
+
+    Frag repeatStar(Frag inner)
+    {
+        int state = addState(ST_SPLIT, 0, inner.start, -1);
+        patch(inner.out, state);
+        return { state, onePatch(state, 2) };
+    }
+
+    void tokenize(const string& pattern)
+    {
+        size_t i = 0;
+        string cp;
+
+        while (nextCp(pattern, i, cp)) {
+            if (cp.size() == 1 && cp[0] == '\\') {
+                string escaped;
+                if (!nextCp(pattern, i, escaped)) {
+                    bad = true;
+                    return;
+                }
+                tokens.push_back(string("L") + escaped);
+            } else if (cp.size() == 1 && (cp[0] == '(' || cp[0] == ')' || cp[0] == '|' || cp[0] == '*')) {
+                tokens.push_back(cp);
+            } else {
+                tokens.push_back(string("L") + cp);
+            }
+        }
+    }
+
+    bool at(const string& token) const
+    {
+        return tokenPos < static_cast<int>(tokens.size()) && tokens[tokenPos] == token;
+    }
+
+    bool finished() const
+    {
+        return tokenPos >= static_cast<int>(tokens.size());
+    }
+
+    Frag parseExpr()
+    {
+        Frag result = parseConcat();
+        while (!bad && at("|")) {
+            ++tokenPos;
+            Frag right = parseConcat();
+            result = alternate(result, right);
+        }
+        return result;
+    }
+
+    Frag parseConcat()
+    {
+        bool hasAny = false;
+        Frag result = epsilon();
+
+        while (!bad && !finished() && !at(")") && !at("|")) {
+            Frag part = parseRepeat();
+            if (!hasAny) {
+                result = part;
+                hasAny = true;
+            } else {
+                result = concatenate(result, part);
+            }
+        }
+
+        return result;
+    }
+
+    Frag parseRepeat()
+    {
+        if (at("*") || at(")") || at("|") || finished()) {
+            bad = true;
+            return epsilon();
+        }
+
+        Frag result = parseAtom();
+        if (!bad && at("*")) {
+            ++tokenPos;
+            result = repeatStar(result);
+            if (at("*")) {
+                bad = true;
+            }
+        }
+        return result;
+    }
+
+    Frag parseAtom()
+    {
+        if (at("(")) {
+            ++tokenPos;
+            Frag result = parseExpr();
+            if (!at(")")) {
+                bad = true;
+                return result;
+            }
+            ++tokenPos;
+            return result;
+        }
+
+        if (!finished() && !tokens[tokenPos].empty() && tokens[tokenPos][0] == 'L') {
+            string cp = tokens[tokenPos].substr(1);
+            ++tokenPos;
+            return literal(getId(cp));
+        }
+
+        bad = true;
+        return epsilon();
+    }
+
+    bool compile(const string& pattern)
+    {
+        tokenize(pattern);
+        if (bad) {
+            return false;
+        }
+
+        Frag root = parseExpr();
+        if (bad || !finished()) {
+            return false;
+        }
+
+        matchState = addState(ST_MATCH);
+        patch(root.out, matchState);
+        startState = root.start;
+        seen.assign(states.size(), 0);
+        computeStartInfo();
+        return true;
+    }
+
+    void addThread(vector<int>& list, int state) const
+    {
+        if (state < 0 || seen[state] == seenTag) {
+            return;
+        }
+        seen[state] = seenTag;
+
+        const State& current = states[state];
+        if (current.type == ST_SPLIT) {
+            addThread(list, current.out1);
+            addThread(list, current.out2);
+        } else if (current.type == ST_JMP) {
+            addThread(list, current.out1);
+        } else {
+            list.push_back(state);
+        }
+    }
+
+
+    void computeStartInfo()
+    {
+        vector<int> list;
+        ++seenTag;
+        addThread(list, startState);
+        for (int state : list) {
+            const State& current = states[state];
+            if (current.type == ST_MATCH) {
+                nullable = true;
+            } else if (current.type == ST_CHAR) {
+                firstChars.insert(current.ch);
+            }
+        }
+    }
+
+    bool canConsumeBeforeMatch(const vector<int>& list, const vector<int>& text, int pos) const
+    {
+        if (pos >= static_cast<int>(text.size())) {
+            return false;
+        }
+
+        const int ch = text[pos];
+        for (int state : list) {
+            const State& current = states[state];
+            if (current.type == ST_MATCH) {
+                return false;
+            }
+            if (current.type == ST_CHAR && current.ch == ch) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int findMatchEnd(const vector<int>& text, int start, bool allowEmpty) const
+    {
+        vector<int> current;
+        vector<int> next;
+        int pos = start;
+        int candidate = -1;
+
+        ++seenTag;
+        if (seenTag == INT_MAX) {
+            fill(seen.begin(), seen.end(), 0);
+            seenTag = 1;
+        }
+        addThread(current, startState);
+
+        while (true) {
+            bool hasMatch = false;
+            for (int state : current) {
+                if (states[state].type == ST_MATCH) {
+                    hasMatch = true;
+                    break;
+                }
+            }
+
+            if (hasMatch && (allowEmpty || pos > start)) {
+                candidate = pos;
+                if (!canConsumeBeforeMatch(current, text, pos)) {
+                    return candidate;
+                }
+            }
+
+            if (pos >= static_cast<int>(text.size())) {
+                return candidate;
+            }
+
+            next.clear();
+            ++seenTag;
+            if (seenTag == INT_MAX) {
+                fill(seen.begin(), seen.end(), 0);
+                seenTag = 1;
+            }
+
+            const int ch = text[pos];
+            for (int state : current) {
+                const State& currentState = states[state];
+                if (currentState.type == ST_CHAR && currentState.ch == ch) {
+                    addThread(next, currentState.out1);
+                }
+            }
+
+            if (next.empty()) {
+                return candidate;
+            }
+
+            current.swap(next);
+            ++pos;
+        }
+    }
+
+    int countLine(const vector<int>& text) const
+    {
+        int answer = 0;
+        int pos = 0;
+        bool allowEmpty = true;
+        const int size = static_cast<int>(text.size());
+
+        while (pos <= size) {
+            if (!nullable && allowEmpty) {
+                if (pos >= size || firstChars.find(text[pos]) == firstChars.end()) {
+                    ++pos;
+                    allowEmpty = true;
+                    continue;
+                }
+            }
+
+            int end = findMatchEnd(text, pos, allowEmpty);
+            if (end >= 0) {
+                ++answer;
+                if (end == pos) {
+                    allowEmpty = false;
+                } else {
+                    pos = end;
+                    allowEmpty = true;
+                }
+            } else {
+                ++pos;
+                allowEmpty = true;
+            }
+        }
+
+        return answer;
+    }
+};
+
+static bool isStripChar(unsigned char c)
+{
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\v' || c == '\f';
+}
+
+static string stripLine(const string& line)
+{
+    size_t left = 0;
+    size_t right = line.size();
+
+    while (left < right && isStripChar(static_cast<unsigned char>(line[left]))) {
+        ++left;
+    }
+
+    while (right > left && isStripChar(static_cast<unsigned char>(line[right - 1]))) {
+        --right;
+    }
+
+    return line.substr(left, right - left);
+}
+
+int main(int argc, char** argv)
+{
+    ios::sync_with_stdio(false);
+
+    if (argc != 4) {
+        return 1;
+    }
+
+    ifstream regexInput(argv[1]);
+    ifstream textInput(argv[2]);
+    ofstream output(argv[3]);
+
+    if (!regexInput || !textInput || !output) {
+        return 1;
+    }
+
+    vector<Engine> engines;
+    vector<char> valid;
+    string line;
+
+    while (getline(regexInput, line)) {
+        line = stripLine(line);
+        if (line.empty()) {
+            continue;
+        }
+        Engine engine;
+        bool ok = engine.compile(line);
+        valid.push_back(ok ? 1 : 0);
+        engines.push_back(std::move(engine));
+    }
+
+    while (getline(textInput, line)) {
+        line = stripLine(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        vector<int> text = transformText(line);
+        for (size_t i = 0; i < engines.size(); ++i) {
+            if (i != 0) {
+                output << ' ';
+            }
+            if (valid[i]) {
+                output << engines[i].countLine(text);
+            } else {
+                output << -1;
+            }
+        }
+        output << '\n';
+    }
+
+    return 0;
+}
